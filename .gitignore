@@ -1,4 +1,6 @@
 build/
+.venv/
+.venv.bak/
+tools/
 .cache/
 compile_commands.json
-

@@ -6,11 +6,11 @@ Status: MVP skeleton. It implements the universal execution model (targets + com
 
 ## Build
 
-Linux:
+Linux (no root required, installs user-space toolchain):
 
 ```bash
-cmake -S . -B build
-cmake --build build
+./scripts/install_toolchain.sh
+./scripts/build.sh
 ./build/bmcli --help
 ```
 
