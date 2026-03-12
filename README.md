@@ -4,6 +4,10 @@
 
 Status: MVP skeleton. It implements the universal execution model (targets + commands + repeat/concurrency) but does not talk to real Redfish/IPMI yet.
 
+## Docs
+
+- PRD: `docs/PRD.md`
+
 ## Build
 
 Linux (no root required, installs user-space toolchain):
