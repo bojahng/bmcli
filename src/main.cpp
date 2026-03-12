@@ -24,8 +24,11 @@
 #  include <ws2tcpip.h>
 #  pragma comment(lib, "Ws2_32.lib")
 #else
+#  include <errno.h>
+#  include <fcntl.h>
 #  include <netdb.h>
 #  include <sys/socket.h>
+#  include <sys/time.h>
 #  include <sys/types.h>
 #  include <unistd.h>
 #endif
@@ -96,6 +99,48 @@ std::string json_escape(const std::string& s) {
   return out;
 }
 
+std::string extract_json_string_value(const std::string& body, const std::string& key) {
+  // Very small helper for mock validation; not a general JSON parser.
+  const std::string needle = "\"" + key + "\"";
+  size_t pos = body.find(needle);
+  if (pos == std::string::npos) return {};
+  pos = body.find(':', pos + needle.size());
+  if (pos == std::string::npos) return {};
+  pos++;
+  while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) pos++;
+  if (pos >= body.size() || body[pos] != '"') return {};
+  pos++;
+  std::string out;
+  while (pos < body.size()) {
+    char c = body[pos++];
+    if (c == '"') break;
+    if (c == '\\' && pos < body.size()) {
+      char esc = body[pos++];
+      // Minimal unescape to keep it simple.
+      out.push_back(esc);
+      continue;
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+
+long long extract_json_int_value(const std::string& body, const std::string& key, bool& ok) {
+  ok = false;
+  const std::string needle = "\"" + key + "\"";
+  size_t pos = body.find(needle);
+  if (pos == std::string::npos) return 0;
+  pos = body.find(':', pos + needle.size());
+  if (pos == std::string::npos) return 0;
+  pos++;
+  while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) pos++;
+  size_t start = pos;
+  while (pos < body.size() && (std::isdigit(static_cast<unsigned char>(body[pos])) || body[pos] == '-')) pos++;
+  if (start == pos) return 0;
+  ok = true;
+  return std::strtoll(body.substr(start, pos - start).c_str(), nullptr, 10);
+}
+
 std::string now_rfc3339_utc() {
   using namespace std::chrono;
   auto now = system_clock::now();
@@ -154,6 +199,12 @@ struct Options {
   int concurrency = 20;
   int repeat = 1;
   std::chrono::milliseconds every{0};
+  std::chrono::milliseconds connect_timeout{3000};
+  std::chrono::milliseconds timeout{10000};
+  int retry = 0;
+  std::chrono::milliseconds retry_delay{0};
+  bool fail_fast = false;
+  bool ignore_errors = false;
   bool insecure = false;
   bool debug = false;
   std::vector<std::string> cmd_texts;
@@ -168,13 +219,15 @@ void print_usage(std::ostream& os) {
       "Usage:\n"
       "  bmcli [--host HOST | --targets FILE|-] [--user USER] [--password PASS]\n"
       "        [--protocol redfish|ipmi|auto] [--insecure] [-o table|json]\n"
-      "        [--concurrency N] [--repeat N] [--every 10s]\n"
+      "        [--connect-timeout 3s] [--timeout 10s] [--retry N] [--retry-delay 200ms]\n"
+      "        [--concurrency N] [--repeat N] [--every 10s] [--fail-fast] [--ignore-errors]\n"
       "        [--cmd \"...\"]... [--cmd-file FILE] [SUBCOMMAND...]\n"
       "\n"
       "Examples:\n"
       "  bmcli --host 10.0.0.12 --user admin --password xxx power status -o json\n"
       "  bmcli --targets targets.txt --concurrency 20 --cmd \"power status\" --cmd \"health summary\"\n"
       "  bmcli --targets targets.txt --cmd-file commands.txt --every 30s --repeat 10\n"
+      "  bmcli --targets targets.txt --cmd \"power status\" --retry 3 --retry-delay 200ms\n"
       "\n"
       "Notes:\n"
       "  - Redfish is implemented for local testing against mock server (HTTP only).\n"
@@ -252,6 +305,45 @@ bool parse_args(int argc, char** argv, Options& opt, std::string& err) {
         return false;
       }
       opt.every = parsed.value;
+    } else if (a == "--connect-timeout") {
+      std::string v = require_value("--connect-timeout");
+      if (!err.empty()) return false;
+      auto parsed = parse_duration_ms(v);
+      if (!parsed.ok) {
+        err = parsed.error;
+        return false;
+      }
+      opt.connect_timeout = parsed.value;
+    } else if (a == "--timeout") {
+      std::string v = require_value("--timeout");
+      if (!err.empty()) return false;
+      auto parsed = parse_duration_ms(v);
+      if (!parsed.ok) {
+        err = parsed.error;
+        return false;
+      }
+      opt.timeout = parsed.value;
+    } else if (a == "--retry") {
+      std::string v = require_value("--retry");
+      if (!err.empty()) return false;
+      opt.retry = std::atoi(v.c_str());
+      if (opt.retry < 0) {
+        err = "invalid --retry: " + v;
+        return false;
+      }
+    } else if (a == "--retry-delay") {
+      std::string v = require_value("--retry-delay");
+      if (!err.empty()) return false;
+      auto parsed = parse_duration_ms(v);
+      if (!parsed.ok) {
+        err = parsed.error;
+        return false;
+      }
+      opt.retry_delay = parsed.value;
+    } else if (a == "--fail-fast") {
+      opt.fail_fast = true;
+    } else if (a == "--ignore-errors") {
+      opt.ignore_errors = true;
     } else if (a == "--cmd") {
       std::string v = require_value("--cmd");
       if (!err.empty()) return false;
@@ -398,7 +490,8 @@ class Socket {
   Socket(const Socket&) = delete;
   Socket& operator=(const Socket&) = delete;
 
-  bool connect_tcp(const std::string& host, const std::string& port, std::string& err) {
+  bool connect_tcp(const std::string& host, const std::string& port, std::chrono::milliseconds connect_timeout,
+                   std::string& err) {
 #if defined(_WIN32)
     static std::once_flag once;
     std::call_once(once, []() {
@@ -428,7 +521,7 @@ class Socket {
     for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
       socket_t s = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
       if (s == invalid()) continue;
-      if (::connect(s, rp->ai_addr, static_cast<int>(rp->ai_addrlen)) == 0) {
+      if (connect_with_timeout(s, rp, connect_timeout, err)) {
         fd_ = s;
         freeaddrinfo(result);
         return true;
@@ -438,6 +531,35 @@ class Socket {
     freeaddrinfo(result);
     err = "connect failed";
     return false;
+  }
+
+  bool set_io_timeout(std::chrono::milliseconds timeout, std::string& err) {
+    if (fd_ == invalid()) return true;
+#if defined(_WIN32)
+    DWORD tv = static_cast<DWORD>(timeout.count());
+    if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv)) != 0) {
+      err = "setsockopt SO_RCVTIMEO failed";
+      return false;
+    }
+    if (setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv)) != 0) {
+      err = "setsockopt SO_SNDTIMEO failed";
+      return false;
+    }
+    return true;
+#else
+    struct timeval tv;
+    tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
+    if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+      err = "setsockopt SO_RCVTIMEO failed";
+      return false;
+    }
+    if (setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
+      err = "setsockopt SO_SNDTIMEO failed";
+      return false;
+    }
+    return true;
+#endif
   }
 
   bool send_all(const std::string& data, std::string& err) {
@@ -495,15 +617,100 @@ class Socket {
 #endif
 
   socket_t fd_ = invalid();
+
+  static bool set_nonblocking(socket_t s, bool nb) {
+#if defined(_WIN32)
+    u_long mode = nb ? 1UL : 0UL;
+    return ioctlsocket(s, FIONBIO, &mode) == 0;
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) return false;
+    if (nb) flags |= O_NONBLOCK;
+    else flags &= ~O_NONBLOCK;
+    return fcntl(s, F_SETFL, flags) == 0;
+#endif
+  }
+
+  static bool connect_with_timeout(socket_t s, const struct addrinfo* rp, std::chrono::milliseconds timeout,
+                                   std::string& err) {
+    if (timeout.count() <= 0) timeout = std::chrono::milliseconds(1);
+    if (!set_nonblocking(s, true)) {
+      // Fall back to blocking connect.
+      if (::connect(s, rp->ai_addr, static_cast<int>(rp->ai_addrlen)) == 0) return true;
+      err = "connect failed";
+      return false;
+    }
+
+    int rc = ::connect(s, rp->ai_addr, static_cast<int>(rp->ai_addrlen));
+#if defined(_WIN32)
+    if (rc == 0) {
+      set_nonblocking(s, false);
+      return true;
+    }
+    int werr = WSAGetLastError();
+    if (werr != WSAEWOULDBLOCK && werr != WSAEINPROGRESS && werr != WSAEINVAL) {
+      err = "connect failed";
+      return false;
+    }
+#else
+    if (rc == 0) {
+      set_nonblocking(s, false);
+      return true;
+    }
+    if (errno != EINPROGRESS) {
+      err = "connect failed";
+      return false;
+    }
+#endif
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(s, &wfds);
+    struct timeval tv;
+    tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+
+    int sel = select(static_cast<int>(s + 1), nullptr, &wfds, nullptr, &tv);
+    if (sel <= 0) {
+      err = (sel == 0) ? "connect timeout" : "connect failed";
+      return false;
+    }
+
+    int so_error = 0;
+#if defined(_WIN32)
+    int so_len = sizeof(so_error);
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &so_len) != 0) {
+      err = "connect failed";
+      return false;
+    }
+#else
+    socklen_t so_len = sizeof(so_error);
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &so_error, &so_len) != 0) {
+      err = "connect failed";
+      return false;
+    }
+#endif
+    if (so_error != 0) {
+      err = "connect failed";
+      return false;
+    }
+    set_nonblocking(s, false);
+    return true;
+  }
 };
 
 HttpResponse http_request(const std::string& host, const std::string& port, const std::string& method,
                           const std::string& path, const std::map<std::string, std::string>& headers,
-                          const std::string& body) {
+                          const std::string& body, std::chrono::milliseconds connect_timeout,
+                          std::chrono::milliseconds io_timeout) {
   HttpResponse resp;
   Socket s;
   std::string err;
-  if (!s.connect_tcp(host, port, err)) {
+  if (!s.connect_tcp(host, port, connect_timeout, err)) {
+    resp.error = err;
+    return resp;
+  }
+  if (!s.set_io_timeout(io_timeout, err)) {
     resp.error = err;
     return resp;
   }
@@ -726,16 +933,36 @@ CommandResult execute_redfish_command(const Options& opt, const Target& t, const
     headers["Authorization"] = "Basic " + base64_encode(t.username + ":" + t.password);
   }
 
-  auto http = http_request(ep.host, ep.port, method, path, headers, body);
+  HttpResponse http;
+  for (int attempt = 0; attempt <= opt.retry; ++attempt) {
+    http = http_request(ep.host, ep.port, method, path, headers, body, opt.connect_timeout, opt.timeout);
+    bool success = http.ok && http.status >= 200 && http.status < 300;
+    bool retryable = !http.ok || (http.status >= 500 && http.status <= 599);
+    if (success || !retryable || attempt == opt.retry) break;
+    if (opt.retry_delay.count() > 0) std::this_thread::sleep_for(opt.retry_delay);
+  }
   auto end = clock::now();
   long long dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
   bool ok = http.ok && http.status >= 200 && http.status < 300;
+  std::string power_state;
+  long long sel_count = 0;
+  bool sel_ok = false;
+
+  if (ok && module == "power" && action == "status") {
+    power_state = extract_json_string_value(http.body, "PowerState");
+  }
+  if (ok && module == "sel" && (action == "list" || action == "get")) {
+    sel_count = extract_json_int_value(http.body, "Members@odata.count", sel_ok);
+  }
+
   std::ostringstream data;
   data << "{"
        << "\"http_status\":" << (http.ok ? http.status : 0) << ","
-       << "\"body\":\"" << json_escape(http.body) << "\""
-       << "}";
+       << "\"body\":\"" << json_escape(http.body) << "\"";
+  if (!power_state.empty()) data << ",\"power_state\":\"" << json_escape(power_state) << "\"";
+  if (sel_ok) data << ",\"sel_count\":" << sel_count;
+  data << "}";
 
   if (opt.debug) {
     std::cerr << "[debug] redfish " << method << " " << ep.host << ":" << ep.port << path
@@ -787,6 +1014,7 @@ RunResult execute_run(const Options& opt, const std::vector<Target>& targets, co
   run.targets.resize(targets.size());
 
   std::atomic<size_t> next{0};
+  std::atomic<bool> stop{false};
 
   int workers = std::min<int>(opt.concurrency, static_cast<int>(targets.size()));
   std::vector<std::thread> threads;
@@ -795,6 +1023,7 @@ RunResult execute_run(const Options& opt, const std::vector<Target>& targets, co
   for (int w = 0; w < workers; ++w) {
     threads.emplace_back([&]() {
       while (true) {
+        if (opt.fail_fast && stop.load()) return;
         size_t idx = next.fetch_add(1);
         if (idx >= targets.size()) return;
         const Target& t = targets[idx];
@@ -813,6 +1042,7 @@ RunResult execute_run(const Options& opt, const std::vector<Target>& targets, co
           if (!r.ok) tr.ok = false;
           tr.results.push_back(std::move(r));
         }
+        if (opt.fail_fast && !tr.ok) stop.store(true);
         run.targets[idx] = std::move(tr);
       }
     });
@@ -824,7 +1054,8 @@ RunResult execute_run(const Options& opt, const std::vector<Target>& targets, co
   return run;
 }
 
-int compute_exit_code(const std::vector<RunResult>& runs) {
+int compute_exit_code(const Options& opt, const std::vector<RunResult>& runs) {
+  if (opt.ignore_errors) return 0;
   for (const auto& run : runs) {
     for (const auto& t : run.targets) {
       if (!t.ok) return 6; // operation rejected/state not allowed (closest placeholder)
@@ -924,5 +1155,5 @@ int main(int argc, char** argv) {
   if (opt.output == "json") print_json(runs);
   else print_table(runs);
 
-  return compute_exit_code(runs);
+  return compute_exit_code(opt, runs);
 }
