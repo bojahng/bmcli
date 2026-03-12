@@ -14,7 +14,17 @@ Linux (no root required, installs user-space toolchain):
 ./build/bmcli --help
 ```
 
-Windows (Developer Command Prompt):
+Windows:
+
+Option A (no admin required, installs user-space toolchain):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\\scripts\\install_toolchain.ps1
+powershell -ExecutionPolicy Bypass -File .\\scripts\\build.ps1
+build\\bmcli.exe --help
+```
+
+Option B (Developer Command Prompt / existing toolchain):
 
 ```bat
 cmake -S . -B build
