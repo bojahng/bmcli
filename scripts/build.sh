@@ -9,18 +9,14 @@ if [[ ! -x ".venv/bin/cmake" ]]; then
   exit 2
 fi
 
-if [[ ! -x "tools/zig-current/zig" ]]; then
-  echo "missing Zig; run: scripts/install_toolchain.sh" >&2
-  exit 2
-fi
+export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
 
 chmod +x scripts/zig-cc scripts/zig-cxx
 
 .venv/bin/cmake -S . -B build -G Ninja \
-  -DCMAKE_C_COMPILER="${ROOT_DIR}/scripts/zig-cc" \
-  -DCMAKE_CXX_COMPILER="${ROOT_DIR}/scripts/zig-cxx"
+  -DCMAKE_CXX_COMPILER="${ROOT_DIR}/scripts/zig-cxx" \
+  -DCMAKE_MAKE_PROGRAM="${ROOT_DIR}/.venv/bin/ninja"
 
 .venv/bin/cmake --build build
 ./build/bmcli --help >/dev/null
 echo "ok: build/bmcli"
-

@@ -376,9 +376,7 @@ std::vector<Command> load_commands(const Options& opt, std::string& err) {
     return {};
   }
   std::string line;
-  size_t line_no = 0;
   while (std::getline(f, line)) {
-    line_no++;
     auto trimmed = line;
     trimmed.erase(trimmed.begin(),
                   std::find_if(trimmed.begin(), trimmed.end(), [](unsigned char c) { return !std::isspace(c); }));
@@ -433,7 +431,6 @@ RunResult execute_run(const Options& opt, const std::vector<Target>& targets, co
   run.targets.resize(targets.size());
 
   std::atomic<size_t> next{0};
-  std::mutex out_mu;
 
   int workers = std::min<int>(opt.concurrency, static_cast<int>(targets.size()));
   std::vector<std::thread> threads;

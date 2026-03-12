@@ -14,32 +14,19 @@ curl -L -o /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py
 .venv/bin/python /tmp/get-pip.py >/dev/null
 
 echo "[bmcli] Installing cmake + ninja (user-space)"
-.venv/bin/pip install --no-cache-dir cmake ninja
+.venv/bin/pip install --no-cache-dir cmake ninja ziglang
 
-ZIG_VERSION="${ZIG_VERSION:-0.13.0}"
-ZIG_TARBALL="zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
-ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}"
-ZIG_DIR="tools/zig-${ZIG_VERSION}"
+ZIG_BIN="$(.venv/bin/python -c 'import ziglang, pathlib; print(pathlib.Path(ziglang.__file__).resolve().parent / "zig")')"
 
-if [[ -x "${ZIG_DIR}/zig" ]]; then
-  echo "[bmcli] Zig already installed at ${ZIG_DIR}"
-else
-  echo "[bmcli] Downloading Zig ${ZIG_VERSION}"
-  curl -L --http1.1 --retry 5 --retry-all-errors --retry-delay 2 \
-    -C - -o "tools/${ZIG_TARBALL}" "${ZIG_URL}"
-  rm -rf "${ZIG_DIR}"
-  mkdir -p "${ZIG_DIR}"
-  tar -xf "tools/${ZIG_TARBALL}" -C tools
-  # Extracted directory name matches tarball prefix.
-  mv "tools/zig-linux-x86_64-${ZIG_VERSION}" "${ZIG_DIR}"
-  ln -sfn "zig-${ZIG_VERSION}" tools/zig-current
+if [[ ! -x "${ZIG_BIN}" ]]; then
+  echo "[bmcli] error: zig not found inside ziglang package at ${ZIG_BIN}" >&2
+  exit 2
 fi
 
 echo "[bmcli] Toolchain ready"
 echo "  - cmake: $(.venv/bin/cmake --version | head -n1)"
 echo "  - ninja: $(.venv/bin/ninja --version)"
-echo "  - zig:   $(tools/zig-current/zig version)"
+echo "  - zig:   $("${ZIG_BIN}" version)"
 echo ""
 echo "Next:"
 echo "  scripts/build.sh"
-

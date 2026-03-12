@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec "${ROOT_DIR}/tools/zig-current/zig" cc "$@"
 
+ZIG_BIN=""
+if [[ -x "${ROOT_DIR}/tools/zig-current/zig" ]]; then
+  ZIG_BIN="${ROOT_DIR}/tools/zig-current/zig"
+else
+  ZIG_BIN="$("${ROOT_DIR}/.venv/bin/python" -c 'import ziglang, pathlib; print(pathlib.Path(ziglang.__file__).resolve().parent / "zig")')"
+fi
+
+exec "${ZIG_BIN}" cc "$@"
