@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -10,12 +11,24 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "Ws2_32.lib")
+#else
+#  include <netdb.h>
+#  include <sys/socket.h>
+#  include <sys/types.h>
+#  include <unistd.h>
+#endif
 
 namespace {
 
@@ -141,6 +154,7 @@ struct Options {
   int concurrency = 20;
   int repeat = 1;
   std::chrono::milliseconds every{0};
+  bool insecure = false;
   bool debug = false;
   std::vector<std::string> cmd_texts;
   std::string cmd_file;
@@ -153,7 +167,7 @@ void print_usage(std::ostream& os) {
       "\n"
       "Usage:\n"
       "  bmcli [--host HOST | --targets FILE|-] [--user USER] [--password PASS]\n"
-      "        [--protocol redfish|ipmi|auto] [-o table|json]\n"
+      "        [--protocol redfish|ipmi|auto] [--insecure] [-o table|json]\n"
       "        [--concurrency N] [--repeat N] [--every 10s]\n"
       "        [--cmd \"...\"]... [--cmd-file FILE] [SUBCOMMAND...]\n"
       "\n"
@@ -163,7 +177,8 @@ void print_usage(std::ostream& os) {
       "  bmcli --targets targets.txt --cmd-file commands.txt --every 30s --repeat 10\n"
       "\n"
       "Notes:\n"
-      "  - This is an execution framework only (no real Redfish/IPMI yet).\n"
+      "  - Redfish is implemented for local testing against mock server (HTTP only).\n"
+      "  - IPMI is not implemented yet.\n"
       "  - targets.txt format: host[,user[,pass[,protocol]]]\n"
       "  - commands.txt format: one command per line; blank lines and lines starting with # are ignored.\n";
 }
@@ -203,6 +218,8 @@ bool parse_args(int argc, char** argv, Options& opt, std::string& err) {
         err = "invalid --protocol: " + opt.protocol;
         return false;
       }
+    } else if (a == "--insecure") {
+      opt.insecure = true;
     } else if (a == "-o" || a == "--output") {
       opt.output = require_value("-o");
       if (!err.empty()) return false;
@@ -291,6 +308,248 @@ std::vector<std::string> split_tokens(std::string s) {
   std::vector<std::string> out;
   for (std::string t; iss >> t;) out.push_back(t);
   return out;
+}
+
+struct ParsedEndpoint {
+  bool ok = false;
+  std::string scheme;
+  std::string host;
+  std::string port;
+  std::string error;
+};
+
+ParsedEndpoint parse_endpoint(std::string host) {
+  ParsedEndpoint ep;
+  ep.ok = false;
+  ep.scheme = "http";
+
+  auto pos = host.find("://");
+  if (pos != std::string::npos) {
+    ep.scheme = host.substr(0, pos);
+    host = host.substr(pos + 3);
+  }
+
+  if (ep.scheme != "http" && ep.scheme != "https") {
+    ep.error = "unsupported scheme: " + ep.scheme;
+    return ep;
+  }
+  if (ep.scheme == "https") {
+    ep.error = "https not supported in MVP (use mock over http)";
+    return ep;
+  }
+
+  // Strip path if accidentally included.
+  auto slash = host.find('/');
+  if (slash != std::string::npos) host = host.substr(0, slash);
+
+  if (host.empty()) {
+    ep.error = "empty host";
+    return ep;
+  }
+
+  auto colon = host.rfind(':');
+  if (colon != std::string::npos) {
+    ep.host = host.substr(0, colon);
+    ep.port = host.substr(colon + 1);
+  } else {
+    ep.host = host;
+    ep.port = "80";
+  }
+  if (ep.host.empty() || ep.port.empty()) {
+    ep.error = "invalid host:port: " + host;
+    return ep;
+  }
+
+  ep.ok = true;
+  return ep;
+}
+
+std::string base64_encode(const std::string& in) {
+  static const char* kTable = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((in.size() + 2) / 3) * 4);
+  size_t i = 0;
+  while (i < in.size()) {
+    unsigned char b0 = static_cast<unsigned char>(in[i++]);
+    bool has_b1 = i < in.size();
+    unsigned char b1 = has_b1 ? static_cast<unsigned char>(in[i++]) : 0;
+    bool has_b2 = i < in.size();
+    unsigned char b2 = has_b2 ? static_cast<unsigned char>(in[i++]) : 0;
+
+    out.push_back(kTable[(b0 >> 2) & 0x3F]);
+    out.push_back(kTable[((b0 & 0x03) << 4) | ((b1 >> 4) & 0x0F)]);
+    out.push_back(has_b1 ? kTable[((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)] : '=');
+    out.push_back(has_b2 ? kTable[b2 & 0x3F] : '=');
+  }
+  return out;
+}
+
+struct HttpResponse {
+  bool ok = false;
+  int status = 0;
+  std::string body;
+  std::string error;
+};
+
+class Socket {
+ public:
+  Socket() = default;
+  ~Socket() { close(); }
+  Socket(const Socket&) = delete;
+  Socket& operator=(const Socket&) = delete;
+
+  bool connect_tcp(const std::string& host, const std::string& port, std::string& err) {
+#if defined(_WIN32)
+    static std::once_flag once;
+    std::call_once(once, []() {
+      WSADATA wsaData;
+      if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        // Best effort; subsequent socket calls will fail with connect error.
+      }
+    });
+#endif
+
+    struct addrinfo hints {};
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo* result = nullptr;
+    int rc = getaddrinfo(host.c_str(), port.c_str(), &hints, &result);
+    if (rc != 0 || result == nullptr) {
+#if defined(_WIN32)
+      err = "getaddrinfo failed";
+#else
+      err = std::string("getaddrinfo failed: ") + gai_strerror(rc);
+#endif
+      return false;
+    }
+
+    for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+      socket_t s = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+      if (s == invalid()) continue;
+      if (::connect(s, rp->ai_addr, static_cast<int>(rp->ai_addrlen)) == 0) {
+        fd_ = s;
+        freeaddrinfo(result);
+        return true;
+      }
+      close_socket(s);
+    }
+    freeaddrinfo(result);
+    err = "connect failed";
+    return false;
+  }
+
+  bool send_all(const std::string& data, std::string& err) {
+    const char* p = data.data();
+    size_t remaining = data.size();
+    while (remaining > 0) {
+#if defined(_WIN32)
+      int n = ::send(fd_, p, static_cast<int>(remaining), 0);
+#else
+      ssize_t n = ::send(fd_, p, remaining, 0);
+#endif
+      if (n <= 0) {
+        err = "send failed";
+        return false;
+      }
+      p += n;
+      remaining -= static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  bool recv_all(std::string& out, std::string& err) {
+    char buf[4096];
+    while (true) {
+#if defined(_WIN32)
+      int n = ::recv(fd_, buf, static_cast<int>(sizeof(buf)), 0);
+#else
+      ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+#endif
+      if (n < 0) {
+        err = "recv failed";
+        return false;
+      }
+      if (n == 0) break;
+      out.append(buf, buf + n);
+    }
+    return true;
+  }
+
+  void close() {
+    if (fd_ == invalid()) return;
+    close_socket(fd_);
+    fd_ = invalid();
+  }
+
+ private:
+#if defined(_WIN32)
+  using socket_t = SOCKET;
+  static socket_t invalid() { return INVALID_SOCKET; }
+  static void close_socket(socket_t s) { closesocket(s); }
+#else
+  using socket_t = int;
+  static socket_t invalid() { return -1; }
+  static void close_socket(socket_t s) { ::close(s); }
+#endif
+
+  socket_t fd_ = invalid();
+};
+
+HttpResponse http_request(const std::string& host, const std::string& port, const std::string& method,
+                          const std::string& path, const std::map<std::string, std::string>& headers,
+                          const std::string& body) {
+  HttpResponse resp;
+  Socket s;
+  std::string err;
+  if (!s.connect_tcp(host, port, err)) {
+    resp.error = err;
+    return resp;
+  }
+
+  std::ostringstream req;
+  req << method << " " << path << " HTTP/1.1\r\n";
+  req << "Host: " << host << "\r\n";
+  req << "Connection: close\r\n";
+  for (const auto& kv : headers) req << kv.first << ": " << kv.second << "\r\n";
+  if (!body.empty()) {
+    req << "Content-Type: application/json\r\n";
+    req << "Content-Length: " << body.size() << "\r\n";
+  } else {
+    req << "Content-Length: 0\r\n";
+  }
+  req << "\r\n";
+  req << body;
+
+  if (!s.send_all(req.str(), err)) {
+    resp.error = err;
+    return resp;
+  }
+  std::string raw;
+  if (!s.recv_all(raw, err)) {
+    resp.error = err;
+    return resp;
+  }
+
+  auto header_end = raw.find("\r\n\r\n");
+  if (header_end == std::string::npos) {
+    resp.error = "invalid http response";
+    return resp;
+  }
+  std::string header = raw.substr(0, header_end);
+  resp.body = raw.substr(header_end + 4);
+
+  std::istringstream hs(header);
+  std::string httpver;
+  hs >> httpver >> resp.status;
+  if (resp.status <= 0) {
+    resp.error = "invalid http status";
+    return resp;
+  }
+
+  resp.ok = true;
+  return resp;
 }
 
 std::vector<Target> load_targets(const Options& opt, std::string& err) {
@@ -390,6 +649,103 @@ std::vector<Command> load_commands(const Options& opt, std::string& err) {
   return cmds;
 }
 
+CommandResult execute_redfish_command(const Options& opt, const Target& t, const Command& c) {
+  using clock = std::chrono::steady_clock;
+  auto start = clock::now();
+
+  auto ep = parse_endpoint(t.host);
+  if (!ep.ok) {
+    auto end = clock::now();
+    long long dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    std::ostringstream data;
+    data << "{"
+         << "\"http_status\":0,"
+         << "\"body\":\"\","
+         << "\"error\":\"" << json_escape(ep.error) << "\""
+         << "}";
+    return CommandResult{c.text, false, ep.error, data.str(), dur_ms};
+  }
+
+  auto tokens = split_tokens(c.text);
+  if (tokens.size() < 2) {
+    auto end = clock::now();
+    long long dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    return CommandResult{c.text, false, "invalid command: " + c.text, "{\"http_status\":0,\"body\":\"\"}", dur_ms};
+  }
+
+  std::string module = tokens[0];
+  std::string action = tokens[1];
+
+  std::string method = "GET";
+  std::string path;
+  std::string body;
+
+  if (module == "power") {
+    if (action == "status") {
+      path = "/redfish/v1/Systems/1";
+      method = "GET";
+    } else if (action == "on" || action == "off" || action == "cycle" || action == "reset") {
+      path = "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset";
+      method = "POST";
+      std::string reset_type = "On";
+      if (action == "off") reset_type = "ForceOff";
+      else if (action == "cycle") reset_type = "PowerCycle";
+      else if (action == "reset") reset_type = "ForceRestart";
+      body = std::string("{\"ResetType\":\"") + reset_type + "\"}";
+    }
+  } else if (module == "sel") {
+    if (action == "list" || action == "get") {
+      path = "/redfish/v1/Managers/1/LogServices/SEL/Entries";
+      method = "GET";
+    } else if (action == "clear") {
+      path = "/redfish/v1/Managers/1/LogServices/SEL/Actions/LogService.ClearLog";
+      method = "POST";
+      body = "{}";
+    }
+  } else if (module == "sensor") {
+    if (action == "list" || action == "get") {
+      path = "/redfish/v1/Chassis/1/Thermal";
+      method = "GET";
+    }
+  } else if (module == "health") {
+    if (action == "summary") {
+      path = "/redfish/v1/Systems/1";
+      method = "GET";
+    }
+  }
+
+  if (path.empty()) {
+    auto end = clock::now();
+    long long dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    return CommandResult{c.text, false, "unsupported command for redfish: " + c.text,
+                         "{\"http_status\":0,\"body\":\"\"}", dur_ms};
+  }
+
+  std::map<std::string, std::string> headers;
+  if (!t.username.empty() || !t.password.empty()) {
+    headers["Authorization"] = "Basic " + base64_encode(t.username + ":" + t.password);
+  }
+
+  auto http = http_request(ep.host, ep.port, method, path, headers, body);
+  auto end = clock::now();
+  long long dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+  bool ok = http.ok && http.status >= 200 && http.status < 300;
+  std::ostringstream data;
+  data << "{"
+       << "\"http_status\":" << (http.ok ? http.status : 0) << ","
+       << "\"body\":\"" << json_escape(http.body) << "\""
+       << "}";
+
+  if (opt.debug) {
+    std::cerr << "[debug] redfish " << method << " " << ep.host << ":" << ep.port << path
+              << " status=" << (http.ok ? std::to_string(http.status) : "0") << "\n";
+  }
+
+  std::string err = ok ? "" : (http.ok ? ("http " + std::to_string(http.status)) : http.error);
+  return CommandResult{c.text, ok, err, data.str(), dur_ms};
+}
+
 CommandResult execute_command_stub(const Target& t, const Command& c, bool debug) {
   using clock = std::chrono::steady_clock;
   auto start = clock::now();
@@ -448,7 +804,12 @@ RunResult execute_run(const Options& opt, const std::vector<Target>& targets, co
         tr.ok = true;
         tr.results.reserve(cmds.size());
         for (const auto& c : cmds) {
-          auto r = execute_command_stub(t, c, opt.debug);
+          CommandResult r;
+          if (t.protocol == "redfish" || t.protocol == "auto") {
+            r = execute_redfish_command(opt, t, c);
+          } else {
+            r = execute_command_stub(t, c, opt.debug);
+          }
           if (!r.ok) tr.ok = false;
           tr.results.push_back(std::move(r));
         }

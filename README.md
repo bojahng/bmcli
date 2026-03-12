@@ -60,3 +60,17 @@ Repeat execution:
 ```
 
 Targets file format (`targets.txt`): one target per line: `host[,user[,pass[,protocol]]]`. `protocol` is `redfish|ipmi|auto`.
+
+## Test (No Real BMC Required)
+
+Linux:
+
+```bash
+./scripts/smoke_test.sh
+```
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\\scripts\\smoke_test.ps1
+```

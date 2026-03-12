@@ -1,0 +1,5 @@
+# One command per line
+power status
+sensor list
+sel list
+
